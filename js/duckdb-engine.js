@@ -448,12 +448,43 @@ async function loadRowsAsTable(rows, tableName) {
 // regardless of type -- caught on first real multi-file upload ("Expected
 // a transaction log, detected 'attendance' instead"). Fixed by building
 // the other four handlers and dispatching by detected kind in index.html.
+// Ensures local benchmark_latest / brand_fallback_latest tables exist
+// before curation runs, pulled fresh from Supabase every time -- NOT
+// scoped to "only if a benchmark file happens to be in this same upload
+// batch." A transaction log upload needs the CURRENT authoritative
+// benchmark regardless of whether today's batch also includes one; the
+// benchmark rarely changes, the transaction log changes constantly.
+// Degrades gracefully to empty-but-correctly-shaped tables (confirmed via
+// testing) rather than erroring, so a first-ever upload with no benchmark
+// data yet still curates -- every row just resolves to bench_tier='none'.
+async function ensureLocalBenchmarkTables(supabaseClient) {
+  const benchRows = await supabaseClient.pullLatestBenchmark();
+  if (benchRows && benchRows.length) {
+    await loadRowsAsTable(benchRows, 'benchmark_latest');
+  } else {
+    await conn.query(`create or replace table benchmark_latest (
+      client text, signature text, lines_per_order integer,
+      p25 double, p50 double, p75 double, trimmed double,
+      usable boolean, spread_flag text)`);
+  }
+
+  const fallbackRows = await supabaseClient.pullLatestBrandFallback();
+  if (fallbackRows && fallbackRows.length) {
+    await loadRowsAsTable(fallbackRows, 'brand_fallback_latest');
+  } else {
+    await conn.query(`create or replace table brand_fallback_latest (
+      client text, p25 double, p50 double, p75 double, trimmed double)`);
+  }
+}
+
 export async function ingestNewUpload(rawFile, supabaseClient) {
   await registerRawFile(rawFile, 'raw_upload');
   const kind = await detectFileKind('raw_upload');
   if (kind !== 'txn') {
     throw new Error(`Expected a transaction log, detected '${kind}' instead. Nothing curated.`);
   }
+
+  await ensureLocalBenchmarkTables(supabaseClient);
 
   await conn.query(`create or replace table curated_packing as ${curationQueryText('raw_upload')}`);
   const curatedRows = (await conn.query(`select * from curated_packing`)).toArray()
