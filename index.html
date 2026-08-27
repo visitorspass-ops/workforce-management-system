@@ -94,7 +94,9 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-  import { initEngine, ingestNewUpload, loadAndClassify, computeHeadcount } from './js/duckdb-engine.js';
+  import { initEngine, ingestNewUpload, ingestBenchmark, ingestBrandFallback, ingestAttendance,
+    ingestEmployeeMapping, ingestSkuMapping, registerRawFile, detectFileKind,
+    loadAndClassify, computeHeadcount } from './js/duckdb-engine.js';
   import { initSupabase, pullLatestBenchmark, pullLatestBrandFallback } from './js/supabase-client.js';
 
   // --------------------------------------------------------------------
@@ -167,8 +169,28 @@
     document.getElementById('runMsg').textContent = 'Processing...';
     try {
       for (const d of detected) {
-        const result = await ingestNewUpload(d.file, supabaseClient);
-        showToast(`${d.name}: ${result.curatedRowCount} rows curated and pushed.`);
+        // Detect kind first, then route to the matching handler -- an
+        // earlier version called ingestNewUpload() (transaction-log-only)
+        // on every file regardless of type, which broke the moment a
+        // multi-file batch included anything else. registerRawFile/
+        // detectFileKind here is a cheap "peek" -- the matched ingest
+        // function below re-registers the same file internally, which is
+        // redundant but harmless (small files, correctness over speed
+        // for this pass).
+        await registerRawFile(d.file, 'raw_upload');
+        const kind = await detectFileKind('raw_upload');
+
+        let result;
+        if (kind === 'txn') result = await ingestNewUpload(d.file, supabaseClient);
+        else if (kind === 'benchmark') result = await ingestBenchmark(d.file, supabaseClient);
+        else if (kind === 'brand_fallback') result = await ingestBrandFallback(d.file, supabaseClient);
+        else if (kind === 'attendance') result = await ingestAttendance(d.file, supabaseClient);
+        else if (kind === 'employee_mapping') result = await ingestEmployeeMapping(d.file, supabaseClient);
+        else if (kind === 'sku_mapping') result = await ingestSkuMapping(d.file, supabaseClient);
+        else { showToast(`${d.name}: unrecognized file type, skipped.`); continue; }
+
+        const count = result.curatedRowCount ?? result.rowCount;
+        showToast(`${d.name} (${kind}): ${count} rows loaded.`);
       }
       await openShell();
     } catch (e) {
