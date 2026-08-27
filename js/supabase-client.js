@@ -14,9 +14,27 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 let supabase = null;
 
+// initSupabase() returns a WRAPPER object bundling every function below as
+// a method, NOT the raw Supabase client from createClient(). Every
+// duckdb-engine.js call site uses supabaseClient.pushX()/.pullX() as if
+// these were methods on the client -- they weren't, until this wrapper.
+// (Caught for real only once both files were wired together and actually
+// run: pushBenchmarkVersion errored first here, but every push/pull call
+// throughout duckdb-engine.js had the identical mismatch.)
 export function initSupabase(projectUrl, anonKey) {
   supabase = createClient(projectUrl, anonKey);
-  return supabase;
+  return {
+    pushCuratedRows, pushWmsPresence, pullCuratedPacking,
+    pullLatestBenchmark, pushBenchmarkVersion,
+    pullLatestBrandFallback, pushBrandFallback,
+    pushSkuMapping, pullSkuMapping,
+    pushEmployeeMapping, pullEmployeeMapping,
+    pushAttendance, pullAttendance,
+    pullBreakPermits, addBreakPermit, removeBreakPermit,
+    upsertExceptionMeta, pullExceptionMeta,
+    subscribeToLiveChanges,
+    raw: supabase, // escape hatch for direct client access if ever needed
+  };
 }
 
 /* ----------------------------------------------------------------------
