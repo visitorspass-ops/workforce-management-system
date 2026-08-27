@@ -10,7 +10,10 @@
      PapaParse/XLSX, just a bigger bundle. Runs curation/classification in
      a Web Worker (see js/duckdb-engine.js initEngine()), so a large file
      drop doesn't freeze this tab. -->
-<script src="https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist/duckdb-browser.min.js"></script>
+<!-- DuckDB-Wasm is loaded as an ES module import INSIDE js/duckdb-engine.js
+     now, not via a global-exposing <script> tag here -- that was the actual
+     cause of the "duckdb is not defined" error on first deploy. See the
+     correction note at the top of duckdb-engine.js for what changed. -->
 <style>
   /* Carried forward unchanged from the previous single-file app's CSS --
      none of this was ever the risky part of the rewrite, it doesn't care
