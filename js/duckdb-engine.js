@@ -440,7 +440,14 @@ async function loadRowsAsTable(rows, tableName) {
        everywhere without a separate sync step.
    ---------------------------------------------------------------------- */
 
-// FLOW A: runs once, when a NEW raw file is uploaded.
+// FLOW A: runs once, when a NEW raw file is uploaded. TRANSACTION LOG only
+// -- see ingestBenchmark/ingestBrandFallback/ingestAttendance/
+// ingestEmployeeMapping/ingestSkuMapping below for the other four file
+// types the upload gate accepts. An earlier version of this pipeline only
+// had this one function, and the upload handler called it on every file
+// regardless of type -- caught on first real multi-file upload ("Expected
+// a transaction log, detected 'attendance' instead"). Fixed by building
+// the other four handlers and dispatching by detected kind in index.html.
 export async function ingestNewUpload(rawFile, supabaseClient) {
   await registerRawFile(rawFile, 'raw_upload');
   const kind = await detectFileKind('raw_upload');
@@ -452,10 +459,6 @@ export async function ingestNewUpload(rawFile, supabaseClient) {
   const curatedRows = (await conn.query(`select * from curated_packing`)).toArray()
     .map(r => (r.toJSON ? r.toJSON() : r));
 
-  // wms_presence: extracted from the RAW file (any transaction type, any
-  // row) before it's discarded -- the one signal that can't be recovered
-  // from curated_packing alone. Kept in the schema as a non-load-bearing
-  // diagnostic per your call, even though headcount no longer reads it.
   const presenceRows = (await conn.query(`
     select distinct "Transaction User" as transaction_user_login, "Transaction Date"::date as activity_date
     from raw_upload
@@ -463,12 +466,77 @@ export async function ingestNewUpload(rawFile, supabaseClient) {
 
   await supabaseClient.pushCuratedRows(curatedRows);
   await supabaseClient.pushWmsPresence(presenceRows);
-
-  // Curate-before-delete, confirmed policy: only drop the raw table after
-  // both pushes above have succeeded without throwing.
   await conn.query(`drop table raw_upload`);
 
   return { curatedRowCount: curatedRows.length };
+}
+
+// Shared helper: register, transform via the given SQL, push via the given
+// Supabase function, drop the raw table. Every one of the four handlers
+// below follows this exact shape.
+async function ingestGeneric(rawFile, expectedKind, transformSql, pushFn, supabaseClient) {
+  await registerRawFile(rawFile, 'raw_upload');
+  const kind = await detectFileKind('raw_upload');
+  if (kind !== expectedKind) {
+    throw new Error(`Expected a ${expectedKind} file, detected '${kind}' instead. Nothing loaded.`);
+  }
+  const rows = (await conn.query(transformSql)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
+  await pushFn(rows);
+  await conn.query(`drop table raw_upload`);
+  return { rowCount: rows.length };
+}
+
+export async function ingestBenchmark(rawFile, supabaseClient) {
+  return ingestGeneric(rawFile, 'benchmark', `
+    select client, signature, lines_per_order,
+      spread_p25 as p25, benchmark_p50_line_duration_min as p50, spread_p75 as p75,
+      benchmark_trimmed_mean_line_duration_min as trimmed,
+      (usable::text = 'true') as usable, spread_flag
+    from raw_upload
+  `, supabaseClient.pushBenchmarkVersion, supabaseClient);
+}
+
+export async function ingestBrandFallback(rawFile, supabaseClient) {
+  // Real per-client p25/p50/p75/trimmed data -- confirmed no shape_class
+  // bucketing, just a flat client-keyed table, so no transform needed
+  // beyond passing the columns through as-is.
+  return ingestGeneric(rawFile, 'brand_fallback', `
+    select client, p25, p50, p75, trimmed from raw_upload
+  `, supabaseClient.pushBrandFallback, supabaseClient);
+}
+
+export async function ingestAttendance(rawFile, supabaseClient) {
+  // Explicit strptime format, not an implicit ::timestamp cast -- the old
+  // single-file app relied on the browser's own Date() leniency to parse
+  // this exact "Apr 30, 2026, 8:19 PM" format, which was flagged as a real
+  // cross-browser risk (Chrome is lenient about it, other engines aren't
+  // guaranteed to be). DuckDB's strptime with an explicit format string
+  // parses identically regardless of browser, closing that risk for free.
+  return ingestGeneric(rawFile, 'attendance', `
+    select "Employee ID" as employee_id,
+      strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date as shift_date,
+      "Normal Hours" as normal_hours, "Overtime Hours" as overtime_hours,
+      "Delay (mins)" as delay_mins,
+      strptime("Sign In Time", '%b %d, %Y, %I:%M %p') as sign_in,
+      strptime("Sign Out Time", '%b %d, %Y, %I:%M %p') as sign_out
+    from raw_upload
+  `, supabaseClient.pushAttendance, supabaseClient);
+}
+
+export async function ingestEmployeeMapping(rawFile, supabaseClient) {
+  return ingestGeneric(rawFile, 'employee_mapping', `
+    select employee_name, employee_id, agency, transaction_user_login, match_status,
+      coalesce(mixed_security_signal::text = 'yes', false) as mixed_security_signal,
+      name_variants
+    from raw_upload
+  `, supabaseClient.pushEmployeeMapping, supabaseClient);
+}
+
+export async function ingestSkuMapping(rawFile, supabaseClient) {
+  return ingestGeneric(rawFile, 'sku_mapping', `
+    select "Client" as client, "Product SKU" as sku, "Product Name" as product_name
+    from raw_upload
+  `, supabaseClient.pushSkuMapping, supabaseClient);
 }
 
 // FLOW B: runs every time the app loads data (initial open, a filter
