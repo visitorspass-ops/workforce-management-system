@@ -2,18 +2,27 @@
    duckdb-engine.js — DuckDB-Wasm engine wrapper for Shift Manifest WFM
    ============================================================================
    Every query below is copied verbatim (adjusted only for real column/table
-   names matching schema.sql) from queries that were built and validated
-   against real DuckDB running natively in a test sandbox during this
-   project's design phase — see the session's classification-chain,
-   curation, SKU-affinity, proximity-window, and headcount test scripts.
+   names matching schema.sql) from queries built and validated against real
+   DuckDB running natively in a test sandbox during this project's design
+   phase — see the session's classification-chain, curation, SKU-affinity,
+   proximity-window, and headcount test scripts.
 
-   NOT independently re-verified in this file: the actual browser WASM
-   loading and Web Worker threading mechanics (can't run a real browser
-   here). The SQL text itself is the same engine, same queries, already
-   proven correct — what's untested here is strictly "does this load
-   correctly inside an actual browser tab," which needs to happen once
-   this is deployed and opened for real.
+   CORRECTION, added after the first real deploy: initEngine() below was
+   wrong in two ways, caught by an actual "duckdb is not defined" +
+   "Cannot read properties of null (reading 'registerFileBuffer')" error
+   pair once this was deployed for real:
+     1. It assumed a <script src="..."> tag would expose a global `duckdb`
+        object. DuckDB-Wasm is distributed as an ES module and doesn't work
+        that way — it has to be `import`ed, which is what the line below
+        does now.
+     2. It called `duckdb.createWorker(...)`, a method that does not exist
+        in the real API — fabricated, not verified against DuckDB's actual
+        documentation before being written the first time. Fixed to match
+        the real, documented worker-construction pattern (Blob +
+        importScripts), checked against DuckDB's current official docs
+        before being applied here, not guessed a second time.
 ============================================================================ */
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
 
 let db = null;
 let conn = null;
@@ -22,20 +31,22 @@ let conn = null;
    1. ENGINE BOOTSTRAP
    ---------------------------------------------------------------------- */
 export async function initEngine() {
-  // duckdb-wasm is loaded via CDN <script> tag in index.html (see below),
-  // exposing the global `duckdb` bundle object, same pattern already used
-  // for PapaParse/XLSX in the old single-file app.
   const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
   const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
 
   // Runs in a Web Worker -- heavy CSV parsing/curation happens off the
-  // main thread, so a huge file drop doesn't freeze the UI. This is the
-  // actual mechanism behind the "Vercel Web Worker Host" claim from
-  // several turns back.
-  const worker = await duckdb.createWorker(bundle.mainWorker);
+  // main thread, so a huge file drop doesn't freeze the UI. Real,
+  // documented construction pattern: wrap the worker script in a Blob so
+  // it can be loaded as a same-origin Worker regardless of the CDN's
+  // cross-origin restrictions.
+  const worker_url = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+  );
+  const worker = new Worker(worker_url);
   const logger = new duckdb.ConsoleLogger();
   db = new duckdb.AsyncDuckDB(logger, worker);
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(worker_url);
   conn = await db.connect();
   return conn;
 }
