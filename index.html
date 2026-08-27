@@ -168,29 +168,34 @@
   document.getElementById('runBtn').addEventListener('click', async () => {
     document.getElementById('runMsg').textContent = 'Processing...';
     try {
+      // Detect every file's kind FIRST, then process in a fixed priority
+      // order -- benchmark and brand_fallback before txn, since txn
+      // curation reads whatever's already pushed to Supabase for those.
+      // Processing in drop order instead could mean a benchmark file
+      // sitting in the SAME batch still isn't visible yet when the
+      // transaction log curates, silently falling back to bench_tier=
+      // 'none' even though the real benchmark was right there.
+      const withKinds = [];
       for (const d of detected) {
-        // Detect kind first, then route to the matching handler -- an
-        // earlier version called ingestNewUpload() (transaction-log-only)
-        // on every file regardless of type, which broke the moment a
-        // multi-file batch included anything else. registerRawFile/
-        // detectFileKind here is a cheap "peek" -- the matched ingest
-        // function below re-registers the same file internally, which is
-        // redundant but harmless (small files, correctness over speed
-        // for this pass).
         await registerRawFile(d.file, 'raw_upload');
         const kind = await detectFileKind('raw_upload');
+        withKinds.push({ ...d, kind });
+      }
+      const priority = { benchmark: 0, brand_fallback: 0, employee_mapping: 1, sku_mapping: 1, attendance: 1, txn: 2 };
+      withKinds.sort((a, b) => (priority[a.kind] ?? 1) - (priority[b.kind] ?? 1));
 
+      for (const d of withKinds) {
         let result;
-        if (kind === 'txn') result = await ingestNewUpload(d.file, supabaseClient);
-        else if (kind === 'benchmark') result = await ingestBenchmark(d.file, supabaseClient);
-        else if (kind === 'brand_fallback') result = await ingestBrandFallback(d.file, supabaseClient);
-        else if (kind === 'attendance') result = await ingestAttendance(d.file, supabaseClient);
-        else if (kind === 'employee_mapping') result = await ingestEmployeeMapping(d.file, supabaseClient);
-        else if (kind === 'sku_mapping') result = await ingestSkuMapping(d.file, supabaseClient);
+        if (d.kind === 'txn') result = await ingestNewUpload(d.file, supabaseClient);
+        else if (d.kind === 'benchmark') result = await ingestBenchmark(d.file, supabaseClient);
+        else if (d.kind === 'brand_fallback') result = await ingestBrandFallback(d.file, supabaseClient);
+        else if (d.kind === 'attendance') result = await ingestAttendance(d.file, supabaseClient);
+        else if (d.kind === 'employee_mapping') result = await ingestEmployeeMapping(d.file, supabaseClient);
+        else if (d.kind === 'sku_mapping') result = await ingestSkuMapping(d.file, supabaseClient);
         else { showToast(`${d.name}: unrecognized file type, skipped.`); continue; }
 
         const count = result.curatedRowCount ?? result.rowCount;
-        showToast(`${d.name} (${kind}): ${count} rows loaded.`);
+        showToast(`${d.name} (${d.kind}): ${count} rows loaded.`);
       }
       await openShell();
     } catch (e) {
