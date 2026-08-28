@@ -54,6 +54,12 @@
   .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel-2);border:1px solid var(--go-dim);color:var(--text);padding:10px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;}
   .toast.show{opacity:1;}
   .scopeNote{background:var(--panel);border:1px solid var(--amber-dim);border-radius:8px;padding:14px 18px;font-size:12.5px;color:var(--muted);margin-bottom:20px;}
+  .adminPanel{background:var(--panel);border:1px solid var(--go-dim);border-radius:8px;padding:16px 18px;margin-bottom:24px;}
+  .assignForm{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;}
+  .assignForm .field{display:flex;flex-direction:column;gap:4px;}
+  .assignForm .field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+  .assignForm input{background:var(--panel-2);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12.5px;}
+  .assignForm input:focus{outline:2px solid var(--go-dim);border-color:var(--go);}
 </style>
 </head>
 <body>
@@ -83,6 +89,27 @@
     Inventory/SKU Affinity, Shift Span, Exceptions, etc.) are validated at the query level (see the
     session's test scripts) but not yet wired into this HTML shell.
   </div>
+
+  <div class="adminPanel" id="adminPanel">
+    <h2 style="font-size:16px;">Benchmark Version Assignments <span style="font-size:11px;color:var(--muted);font-weight:400;">(admin only — controls which labeled benchmark/fallback set applies to a date range)</span></h2>
+    <p style="font-size:12px;color:var(--muted);margin:6px 0 14px;">
+      A date with no assignment covering it resolves every order to <span class="mono" style="color:var(--amber);">bench_tier = none</span> —
+      no target, no fallback. This is a global setting: one assignment applies to the whole app, for both
+      benchmark and brand-fallback together.
+    </p>
+    <div class="assignForm">
+      <div class="field"><label>Start Date</label><input type="date" id="assignStart"></div>
+      <div class="field"><label>End Date</label><input type="date" id="assignEnd"></div>
+      <div class="field" style="flex:1;"><label>Effective Label</label><input type="text" id="assignLabel" placeholder="e.g. Q2 2026" class="mono"></div>
+      <button class="runbtn" id="assignBtn" style="padding:9px 16px;font-size:12.5px;">+ Add Assignment</button>
+    </div>
+    <div id="assignMsg" class="runmsg" style="margin-top:8px;"></div>
+    <table id="assignTable" style="margin-top:14px;">
+      <thead><tr><th>Start</th><th>End</th><th>Effective Label</th><th>Created</th></tr></thead>
+      <tbody id="assignTableBody"><tr><td colspan="4">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
   <h2>Per Brand (Primary)</h2>
   <div class="cards" id="statCards"></div>
   <table id="brandTable">
@@ -213,6 +240,65 @@
   document.getElementById('viewBtn').addEventListener('click', openShell);
 
   // ------------------------------------------------------------------
+  // ADMIN — version assignments (date range -> benchmark/fallback label).
+  // Talks directly to Supabase, independent of the DuckDB pipeline; this
+  // is what used to require hand-editing a table in the Supabase UI.
+  // ------------------------------------------------------------------
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function renderVersionAssignments() {
+    const tbody = document.getElementById('assignTableBody');
+    try {
+      const rows = await supabaseClient.pullVersionAssignments();
+      const sorted = (rows || []).slice().sort((a, b) => new Date(b.start_date) - new Date(a.start_date));
+      tbody.innerHTML = sorted.length ? sorted.map(r => `
+        <tr>
+          <td>${r.start_date}</td>
+          <td>${r.end_date}</td>
+          <td><b style="color:var(--go);">${escHtml(r.effective_label)}</b></td>
+          <td style="color:var(--muted);font-size:11px;">${new Date(r.created_at).toLocaleDateString()}</td>
+        </tr>
+      `).join('') : '<tr><td colspan="4">No assignments yet — every order currently resolves to bench_tier = none.</td></tr>';
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="4" style="color:var(--red);">Failed to load: ${escHtml(e.message)}</td></tr>`;
+    }
+  }
+
+  document.getElementById('assignBtn').addEventListener('click', async () => {
+    const startDate = document.getElementById('assignStart').value;
+    const endDate = document.getElementById('assignEnd').value;
+    const effectiveLabel = document.getElementById('assignLabel').value.trim();
+    const msgEl = document.getElementById('assignMsg');
+
+    if (!startDate || !endDate || !effectiveLabel) {
+      msgEl.textContent = 'Start date, end date, and effective label are all required.';
+      msgEl.style.color = 'var(--amber)';
+      return;
+    }
+    if (endDate < startDate) {
+      msgEl.textContent = 'End date can\'t be before start date.';
+      msgEl.style.color = 'var(--amber)';
+      return;
+    }
+
+    msgEl.textContent = 'Saving...';
+    msgEl.style.color = 'var(--muted)';
+    try {
+      await supabaseClient.addVersionAssignment({ startDate, endDate, effectiveLabel });
+      msgEl.textContent = `Saved: ${startDate} → ${endDate} now uses "${effectiveLabel}".`;
+      msgEl.style.color = 'var(--go)';
+      document.getElementById('assignLabel').value = '';
+      await renderVersionAssignments();
+      showToast('Version assignment saved. Reload the Brands view to see it applied.');
+    } catch (e) {
+      msgEl.textContent = 'Failed: ' + e.message;
+      msgEl.style.color = 'var(--red)';
+    }
+  });
+
+  // ------------------------------------------------------------------
   // RENDER — pulls from Supabase, classifies locally, renders the Brands
   // view. This is the proof-of-pipeline page; the rest of the UI follows
   // the same pattern once ported.
@@ -220,6 +306,8 @@
   async function openShell() {
     document.getElementById('uploadGate').style.display = 'none';
     document.getElementById('shell').style.display = 'block';
+
+    await renderVersionAssignments();
 
     try {
       const rows = (await loadAndClassify(supabaseClient, { orderType: 'B2C', statKey: 'bench_p50' })).toArray();
