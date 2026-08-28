@@ -93,6 +93,8 @@
   .progressIcon.active{color:var(--go);}
   .progressIcon.done{color:var(--go);}
   .progressIcon.failed{color:var(--red);}
+  .progressIcon.skipped{color:var(--muted);}
+  .gaveUpBanner{background:var(--red-dim);border:1px solid var(--red);color:#ffb3b6;border-radius:8px;padding:12px 16px;font-size:12.5px;margin-bottom:16px;}
   .progressFileMain{flex:1;min-width:0;}
   .progressFileName{font-size:12.5px;font-family:'JetBrains Mono',monospace;}
   .progressFileStage{font-size:11px;color:var(--muted);margin-top:2px;}
@@ -120,6 +122,9 @@
   </div>
 
   <div id="progressPanel" style="display:none;">
+    <div id="progressGaveUpBanner" class="gaveUpBanner" style="display:none;">
+      ⛔ <b>Stopped — this batch will not continue or retry automatically.</b> Fix the error on the failed file below, then re-drop your files and click Process &amp; Save again.
+    </div>
     <div class="progressOverall">
       <div class="progressOverallLabel">
         <span id="progressOverallText">Starting...</span>
@@ -242,6 +247,7 @@
   function initProgressPanel(files) {
     progressFiles = files.map(f => ({ name: f.name, kind: f.kind, status: 'pending', stage: 'Waiting...', fraction: 0 }));
     document.getElementById('progressPanel').style.display = 'block';
+    document.getElementById('progressGaveUpBanner').style.display = 'none';
     renderProgressPanel();
   }
 
@@ -253,14 +259,16 @@
   function renderProgressPanel() {
     const doneCount = progressFiles.filter(f => f.status === 'done').length;
     const failedCount = progressFiles.filter(f => f.status === 'failed').length;
+    const skippedCount = progressFiles.filter(f => f.status === 'skipped').length;
     const total = progressFiles.length;
+    const settledCount = doneCount + failedCount + skippedCount;
     document.getElementById('progressOverallText').textContent =
-      failedCount ? `Stopped — ${failedCount} file(s) failed` : (doneCount === total ? 'All files processed' : 'Processing files...');
-    document.getElementById('progressOverallCount').textContent = `${doneCount + failedCount} / ${total} files`;
-    document.getElementById('progressOverallBar').style.width = `${Math.round(((doneCount + failedCount) / total) * 100)}%`;
+      failedCount ? `Stopped — ${failedCount} file(s) failed, ${skippedCount} never started` : (doneCount === total ? 'All files processed' : 'Processing files...');
+    document.getElementById('progressOverallCount').textContent = `${settledCount} / ${total} files`;
+    document.getElementById('progressOverallBar').style.width = `${Math.round((settledCount / total) * 100)}%`;
 
     document.getElementById('progressFileList').innerHTML = progressFiles.map(f => {
-      const icon = { pending: '○', active: '◐', done: '✓', failed: '✕' }[f.status];
+      const icon = { pending: '○', active: '◐', done: '✓', failed: '✕', skipped: '⊘' }[f.status];
       const pct = Math.round((f.fraction || 0) * 100);
       return `
         <div class="progressFileRow">
@@ -343,6 +351,13 @@
           else { updateProgressFile(idx, { status: 'failed', stage: 'Unrecognized file type — skipped.' }); continue; }
         } catch (e) {
           updateProgressFile(idx, { status: 'failed', stage: e.message });
+          // Mark every file that hadn't started yet as explicitly abandoned
+          // -- not left sitting at "waiting in queue" forever, which reads
+          // as still-in-progress when it's actually never going to run.
+          progressFiles.forEach((f, i) => {
+            if (f.status === 'pending') updateProgressFile(i, { status: 'skipped', stage: 'Skipped — batch stopped before this file was reached.' });
+          });
+          document.getElementById('progressGaveUpBanner').style.display = 'block';
           throw e; // still stop the whole batch on a real failure, same as before -- but now you can SEE which file and which stage
         }
 
