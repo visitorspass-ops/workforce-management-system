@@ -139,7 +139,15 @@ function curationQueryText(rawTableName) {
     packing_only as (
       select * from with_duration where ttype = 'Packing'
     )
-    select order_code, packer_login, client, order_type, ts, signature, n_lines, duration_min,
+    select order_code, packer_login, client, order_type,
+      strftime(ts, '%Y-%m-%d %H:%M:%S') as ts, -- explicit ISO string, NOT raw TIMESTAMP -- see
+      -- note in ingestAttendance for why: DuckDB-Wasm serializes a raw
+      -- TIMESTAMP to JS as epoch-milliseconds, which Postgres's ::timestamptz
+      -- cast then fails to parse (confirmed by a real failure on the
+      -- structurally identical sign_in/sign_out columns). Formatting here
+      -- guarantees a Postgres-parseable string regardless of Arrow's
+      -- internal representation.
+      signature, n_lines, duration_min,
       next_action_type, target_location
     from packing_only
   `;
@@ -532,7 +540,8 @@ export async function ingestNewUpload(supabaseClient, onStage) {
 
   stage({ label: `Extracting presence records from ${curatedRows.length.toLocaleString()} curated rows...` });
   const presenceRows = (await conn.query(`
-    select distinct "Transaction User" as transaction_user_login, "Transaction Date"::date as activity_date
+    select distinct "Transaction User" as transaction_user_login,
+      strftime("Transaction Date"::date, '%Y-%m-%d') as activity_date
     from raw_upload
   `)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
 
@@ -623,13 +632,21 @@ export async function ingestAttendance(supabaseClient, onStage) {
   // cross-browser risk (Chrome is lenient about it, other engines aren't
   // guaranteed to be). DuckDB's strptime with an explicit format string
   // parses identically regardless of browser, closing that risk for free.
+  //
+  // CONFIRMED BUG, FIXED: sign_in/sign_out used to be selected as raw
+  // strptime() TIMESTAMP values. DuckDB-Wasm serializes a TIMESTAMP to JS
+  // as epoch-milliseconds (e.g. 1777580340000), and Postgres's
+  // ::timestamptz cast in bulk_insert_attendance then fails trying to
+  // parse that number-string as a date literal -- "date/time field value
+  // out of range". Wrapping in strftime() forces an explicit ISO string
+  // before the value ever leaves DuckDB, which Postgres parses correctly.
   return ingestGeneric(`
     select "Employee ID" as employee_id,
-      strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date as shift_date,
+      strftime(strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date, '%Y-%m-%d') as shift_date,
       "Normal Hours" as normal_hours, "Overtime Hours" as overtime_hours,
       "Delay (mins)" as delay_mins,
-      strptime("Sign In Time", '%b %d, %Y, %I:%M %p') as sign_in,
-      strptime("Sign Out Time", '%b %d, %Y, %I:%M %p') as sign_out
+      strftime(strptime("Sign In Time", '%b %d, %Y, %I:%M %p'), '%Y-%m-%d %H:%M:%S') as sign_in,
+      strftime(strptime("Sign Out Time", '%b %d, %Y, %I:%M %p'), '%Y-%m-%d %H:%M:%S') as sign_out
     from raw_upload
   `, supabaseClient.pushAttendance, onStage);
 }
