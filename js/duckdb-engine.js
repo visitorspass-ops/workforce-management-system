@@ -554,12 +554,15 @@ async function ingestGeneric(transformSql, pushFn) {
 }
 
 export async function ingestBenchmark(supabaseClient) {
-  // Requires an "effective" column in the file (e.g. "Q2 2026") -- your own
+  // Requires a "version" column in the file (e.g. "Q2 2026") -- your own
   // confirmed literal label, carried through as-is, not derived or defaulted.
+  // Only "version" is accepted now, not "effective" -- you confirmed
+  // "version" is the real standard, so a file missing it should fail loud
+  // rather than silently matching a name it shouldn't.
   const cols = (await conn.query(`describe raw_upload`)).toArray().map(r => String(r.column_name));
-  const effCol = cols.find(c => c.trim().toLowerCase() === 'effective');
+  const effCol = cols.find(c => c.trim().toLowerCase() === 'version');
   if (!effCol) {
-    throw new Error(`Benchmark file is missing the "effective" column (found: ${cols.join(', ')}). Every benchmark upload needs a version label.`);
+    throw new Error(`Benchmark file is missing the "version" column (found: ${cols.join(', ')}). Every benchmark upload needs a version label.`);
   }
   return ingestGeneric(`
     select client, signature, lines_per_order,
@@ -585,12 +588,12 @@ export async function ingestBrandFallback(supabaseClient) {
   const p50Col = findCol(['p50', 'p50 order duration']);
   const p75Col = findCol(['p75', 'p75 order duration']);
   const trimmedCol = findCol(['trimmed', 'trimmed mean']);
-  const effCol = findCol(['effective']);
+  const effCol = findCol(['version']);
   if (!clientCol || !p25Col || !p50Col || !p75Col || !trimmedCol) {
     throw new Error(`Brand fallback file is missing an expected column (found: ${cols.join(', ')})`);
   }
   if (!effCol) {
-    throw new Error(`Brand fallback file is missing the "effective" column (found: ${cols.join(', ')}). Every fallback upload needs a version label.`);
+    throw new Error(`Brand fallback file is missing the "version" column (found: ${cols.join(', ')}). Every fallback upload needs a version label.`);
   }
   return ingestGeneric(`
     select "${clientCol}" as client, "${p25Col}" as p25, "${p50Col}" as p50,
