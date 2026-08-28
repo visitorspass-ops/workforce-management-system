@@ -84,6 +84,15 @@ export async function detectFileKind(tableName) {
   return 'unknown';
 }
 
+/* Cheap rename -- NOT a re-parse. Lets multiple already-registered raw
+   files be held under distinct names (for up-front kind detection and
+   priority sorting) and then handed to whichever ingestX function
+   matches, all under the one table name ('raw_upload') those functions
+   expect, without ever reading the CSV a second time. */
+export async function renameRawTable(fromName, toName) {
+  await conn.query(`alter table ${fromName} rename to ${toName}`);
+}
+
 /* ----------------------------------------------------------------------
    4. CURATION QUERY — validated against synthetic raw data (multi-SKU
    signature building, B2C filtering, last-action-of-day exclusion,
@@ -459,6 +468,15 @@ async function loadRowsAsTable(rows, tableName) {
 // Degrades gracefully to empty-but-correctly-shaped tables (confirmed via
 // testing) rather than erroring, so a first-ever upload with no benchmark
 // data yet still curates -- every row just resolves to bench_tier='none'.
+// Ensures local benchmark_latest / brand_fallback_latest tables exist
+// before curation runs, pulled fresh from Supabase every time -- NOT
+// scoped to "only if a benchmark file happens to be in this same upload
+// batch." A transaction log upload needs the CURRENT authoritative
+// benchmark regardless of whether today's batch also includes one; the
+// benchmark rarely changes, the transaction log changes constantly.
+// Degrades gracefully to empty-but-correctly-shaped tables (confirmed via
+// testing) rather than erroring, so a first-ever upload with no benchmark
+// data yet still curates -- every row just resolves to bench_tier='none'.
 async function ensureLocalBenchmarkTables(supabaseClient) {
   const benchRows = await supabaseClient.pullLatestBenchmark();
   if (benchRows && benchRows.length) {
@@ -479,13 +497,18 @@ async function ensureLocalBenchmarkTables(supabaseClient) {
   }
 }
 
-export async function ingestNewUpload(rawFile, supabaseClient) {
-  await registerRawFile(rawFile, 'raw_upload');
-  const kind = await detectFileKind('raw_upload');
-  if (kind !== 'txn') {
-    throw new Error(`Expected a transaction log, detected '${kind}' instead. Nothing curated.`);
-  }
+/* All six ingestX functions below now assume 'raw_upload' has ALREADY been
+   registered and kind-detected by the CALLER, exactly once. An earlier
+   version had each function re-register and re-parse the file itself,
+   on top of a "peek" registration the upload handler already did to
+   figure out which function to call in the first place -- meaning every
+   file, including the largest one (the transaction log), got fully
+   CSV-parsed TWICE. Reported as the page becoming unresponsive on a real
+   multi-file upload; fixed by having index.html register+detect once and
+   pass nothing else, with every ingest function operating directly on the
+   already-registered table. */
 
+export async function ingestNewUpload(supabaseClient) {
   await ensureLocalBenchmarkTables(supabaseClient);
 
   await conn.query(`create or replace table curated_packing as ${curationQueryText('raw_upload')}`);
@@ -504,43 +527,32 @@ export async function ingestNewUpload(rawFile, supabaseClient) {
   return { curatedRowCount: curatedRows.length };
 }
 
-// Shared helper: register, transform via the given SQL, push via the given
-// Supabase function, drop the raw table. Every one of the four handlers
-// below follows this exact shape.
-async function ingestGeneric(rawFile, expectedKind, transformSql, pushFn, supabaseClient) {
-  await registerRawFile(rawFile, 'raw_upload');
-  const kind = await detectFileKind('raw_upload');
-  if (kind !== expectedKind) {
-    throw new Error(`Expected a ${expectedKind} file, detected '${kind}' instead. Nothing loaded.`);
-  }
+// Shared helper: transform the already-registered 'raw_upload' table via
+// the given SQL, push via the given Supabase function, drop the raw table.
+async function ingestGeneric(transformSql, pushFn) {
   const rows = (await conn.query(transformSql)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
   await pushFn(rows);
   await conn.query(`drop table raw_upload`);
   return { rowCount: rows.length };
 }
 
-export async function ingestBenchmark(rawFile, supabaseClient) {
-  return ingestGeneric(rawFile, 'benchmark', `
+export async function ingestBenchmark(supabaseClient) {
+  return ingestGeneric(`
     select client, signature, lines_per_order,
       spread_p25 as p25, benchmark_p50_line_duration_min as p50, spread_p75 as p75,
       benchmark_trimmed_mean_line_duration_min as trimmed,
       (usable::text = 'true') as usable, spread_flag
     from raw_upload
-  `, supabaseClient.pushBenchmarkVersion, supabaseClient);
+  `, supabaseClient.pushBenchmarkVersion);
 }
 
-export async function ingestBrandFallback(rawFile, supabaseClient) {
+export async function ingestBrandFallback(supabaseClient) {
   // Real per-client p25/p50/p75/trimmed data, no shape_class bucketing --
   // confirmed. Header naming has ALREADY changed once between two real
   // exports of the same underlying data ("Brand"/"P75 Order Duration"/...
   // vs. "client"/"p75"/...) -- resolving columns dynamically by candidate
   // name here instead of assuming one fixed header set, so a third naming
   // variation doesn't silently break this again the same way.
-  await registerRawFile(rawFile, 'raw_upload');
-  const kind = await detectFileKind('raw_upload');
-  if (kind !== 'brand_fallback') {
-    throw new Error(`Expected a brand_fallback file, detected '${kind}' instead. Nothing loaded.`);
-  }
   const cols = (await conn.query(`describe raw_upload`)).toArray().map(r => String(r.column_name));
   const findCol = (candidates) => cols.find(c => candidates.includes(c.trim().toLowerCase()));
   const clientCol = findCol(['brand', 'client']);
@@ -551,24 +563,21 @@ export async function ingestBrandFallback(rawFile, supabaseClient) {
   if (!clientCol || !p25Col || !p50Col || !p75Col || !trimmedCol) {
     throw new Error(`Brand fallback file is missing an expected column (found: ${cols.join(', ')})`);
   }
-  const rows = (await conn.query(`
+  return ingestGeneric(`
     select "${clientCol}" as client, "${p25Col}" as p25, "${p50Col}" as p50,
       "${p75Col}" as p75, "${trimmedCol}" as trimmed
     from raw_upload
-  `)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
-  await supabaseClient.pushBrandFallback(rows);
-  await conn.query(`drop table raw_upload`);
-  return { rowCount: rows.length };
+  `, supabaseClient.pushBrandFallback);
 }
 
-export async function ingestAttendance(rawFile, supabaseClient) {
+export async function ingestAttendance(supabaseClient) {
   // Explicit strptime format, not an implicit ::timestamp cast -- the old
   // single-file app relied on the browser's own Date() leniency to parse
   // this exact "Apr 30, 2026, 8:19 PM" format, which was flagged as a real
   // cross-browser risk (Chrome is lenient about it, other engines aren't
   // guaranteed to be). DuckDB's strptime with an explicit format string
   // parses identically regardless of browser, closing that risk for free.
-  return ingestGeneric(rawFile, 'attendance', `
+  return ingestGeneric(`
     select "Employee ID" as employee_id,
       strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date as shift_date,
       "Normal Hours" as normal_hours, "Overtime Hours" as overtime_hours,
@@ -576,10 +585,10 @@ export async function ingestAttendance(rawFile, supabaseClient) {
       strptime("Sign In Time", '%b %d, %Y, %I:%M %p') as sign_in,
       strptime("Sign Out Time", '%b %d, %Y, %I:%M %p') as sign_out
     from raw_upload
-  `, supabaseClient.pushAttendance, supabaseClient);
+  `, supabaseClient.pushAttendance);
 }
 
-export async function ingestEmployeeMapping(rawFile, supabaseClient) {
+export async function ingestEmployeeMapping(supabaseClient) {
   // NOTE: DuckDB's CSV auto-detection recognizes "yes"/blank in this
   // column as boolean-like data and converts it to a real boolean (true /
   // NULL) BEFORE this query ever runs -- confirmed by testing against the
@@ -588,19 +597,19 @@ export async function ingestEmployeeMapping(rawFile, supabaseClient) {
   // never match (a real `true` casts to the text 'true', not 'yes'),
   // silently marking every single employee as unflagged regardless of the
   // source data. Fixed to use the already-inferred boolean directly.
-  return ingestGeneric(rawFile, 'employee_mapping', `
+  return ingestGeneric(`
     select employee_name, employee_id, agency, transaction_user_login, match_status,
       coalesce(mixed_security_signal, false) as mixed_security_signal,
       name_variants
     from raw_upload
-  `, supabaseClient.pushEmployeeMapping, supabaseClient);
+  `, supabaseClient.pushEmployeeMapping);
 }
 
-export async function ingestSkuMapping(rawFile, supabaseClient) {
-  return ingestGeneric(rawFile, 'sku_mapping', `
+export async function ingestSkuMapping(supabaseClient) {
+  return ingestGeneric(`
     select "Client" as client, "Product SKU" as sku, "Product Name" as product_name
     from raw_upload
-  `, supabaseClient.pushSkuMapping, supabaseClient);
+  `, supabaseClient.pushSkuMapping);
 }
 
 // FLOW B: runs every time the app loads data (initial open, a filter
