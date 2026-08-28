@@ -633,21 +633,75 @@ export async function ingestAttendance(supabaseClient, onStage) {
   // guaranteed to be). DuckDB's strptime with an explicit format string
   // parses identically regardless of browser, closing that risk for free.
   //
-  // CONFIRMED BUG, FIXED: sign_in/sign_out used to be selected as raw
-  // strptime() TIMESTAMP values. DuckDB-Wasm serializes a TIMESTAMP to JS
-  // as epoch-milliseconds (e.g. 1777580340000), and Postgres's
-  // ::timestamptz cast in bulk_insert_attendance then fails trying to
-  // parse that number-string as a date literal -- "date/time field value
-  // out of range". Wrapping in strftime() forces an explicit ISO string
-  // before the value ever leaves DuckDB, which Postgres parses correctly.
+  // GROUP BY employee_id, shift_date -- CONFIRMED REAL, NOT HYPOTHETICAL:
+  // your actual April.csv has 46 (employee, day) pairs with more than one
+  // row. A single INSERT ... ON CONFLICT DO UPDATE cannot have two rows in
+  // the SAME statement target the same conflict key -- Postgres rejects it
+  // outright, it's not a batching/chunk-size problem.
+  //
+  // Hours are always SUMMED across same-day rows -- both segments are real
+  // worked time whether they're one continuous presence split by the
+  // export's own row structure, or two genuinely separate shifts the same
+  // day. delay_mins uses arg_min(delay_mins, sign_in_ts): only the row
+  // representing the day's actual first clock-in has a meaningful lateness
+  // figure; a later segment's own "Delay (mins)" field is computed against
+  // whatever reference the export assigns that row and doesn't reliably
+  // correspond to anything (confirmed against real data: e.g. one pair had
+  // an actual 3-minute gap between segments while its own Delay field
+  // claimed 544.72 -- no relationship between the two).
+  //
+  // switch_gap_mins -- NEW, computed directly from timestamps, not from the
+  // source Delay field, for the same reason: the source field is unreliable
+  // for this. Only counts a gap between two consecutive same-day segments
+  // as task-switch overhead if it's 0-15 minutes. Longer gaps (confirmed
+  // in real data up to 850 minutes) are genuinely separate shifts with
+  // ordinary rest between them, not overhead, and are excluded from this
+  // figure entirely -- summed as normal_hours/overtime_hours like any
+  // other worked time, just not counted as "switch cost".
   return ingestGeneric(`
-    select "Employee ID" as employee_id,
-      strftime(strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date, '%Y-%m-%d') as shift_date,
-      "Normal Hours" as normal_hours, "Overtime Hours" as overtime_hours,
-      "Delay (mins)" as delay_mins,
-      strftime(strptime("Sign In Time", '%b %d, %Y, %I:%M %p'), '%Y-%m-%d %H:%M:%S') as sign_in,
-      strftime(strptime("Sign Out Time", '%b %d, %Y, %I:%M %p'), '%Y-%m-%d %H:%M:%S') as sign_out
-    from raw_upload
+    with typed as (
+      select "Employee ID" as employee_id,
+        strptime("Sign In Time", '%b %d, %Y, %I:%M %p')::date as shift_date,
+        "Normal Hours" as normal_hours, "Overtime Hours" as overtime_hours,
+        "Delay (mins)" as delay_mins,
+        strptime("Sign In Time", '%b %d, %Y, %I:%M %p') as sign_in_ts,
+        strptime("Sign Out Time", '%b %d, %Y, %I:%M %p') as sign_out_ts
+      from raw_upload
+    ),
+    ordered as (
+      select *,
+        lag(sign_out_ts) over (partition by employee_id, shift_date order by sign_in_ts) as prev_sign_out_ts
+      from typed
+    ),
+    gapped as (
+      select employee_id, shift_date,
+        case when prev_sign_out_ts is not null
+          and date_diff('minute', prev_sign_out_ts, sign_in_ts) between 0 and 15
+        then date_diff('minute', prev_sign_out_ts, sign_in_ts) else 0 end as switch_gap_mins
+      from ordered
+    ),
+    gaps_by_day as (
+      select employee_id, shift_date, sum(switch_gap_mins) as switch_gap_mins
+      from gapped
+      group by employee_id, shift_date
+    ),
+    totals_by_day as (
+      select employee_id, shift_date,
+        sum(normal_hours) as normal_hours,
+        sum(overtime_hours) as overtime_hours,
+        arg_min(delay_mins, sign_in_ts) as delay_mins,
+        min(sign_in_ts) as sign_in_ts,
+        max(sign_out_ts) as sign_out_ts
+      from typed
+      group by employee_id, shift_date
+    )
+    select t.employee_id, strftime(t.shift_date, '%Y-%m-%d') as shift_date,
+      t.normal_hours, t.overtime_hours, t.delay_mins,
+      strftime(t.sign_in_ts, '%Y-%m-%d %H:%M:%S') as sign_in,
+      strftime(t.sign_out_ts, '%Y-%m-%d %H:%M:%S') as sign_out,
+      g.switch_gap_mins
+    from totals_by_day t
+    join gaps_by_day g on g.employee_id = t.employee_id and g.shift_date = t.shift_date
   `, supabaseClient.pushAttendance, onStage);
 }
 
