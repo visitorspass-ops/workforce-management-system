@@ -74,9 +74,11 @@ export async function detectFileKind(tableName) {
   const has = (n) => cols.includes(n.toLowerCase());
   if (has('transaction type') && has('transaction date')) return 'txn';
   if (has('signature') && has('usable')) return 'benchmark';
-  if (has('client') && has('p25') && has('p50') && !has('signature')) return 'brand_fallback';
+  if ((has('brand') || has('client')) && (has('trimmed') || has('trimmed mean'))
+      && (has('p75') || has('p75 order duration') || has('p50') || has('p50 order duration'))
+      && !has('signature')) return 'brand_fallback';
+  if (has('employee_name') && has('employee_id') && has('match_status')) return 'employee_mapping'; // new employee-centric format -- checked BEFORE the legacy check below, since a file can satisfy both and the more specific/newer format should win
   if (has('transaction_user_login') && has('employee_id')) return 'mapping_legacy'; // old packer-centric format, still supported
-  if (has('employee_name') && has('employee_id') && has('match_status')) return 'employee_mapping'; // new employee-centric format
   if (has('employee id') && (has('sign in time') || has('delay (mins)'))) return 'attendance';
   if (has('product sku') && has('product name')) return 'sku_mapping';
   return 'unknown';
@@ -528,12 +530,35 @@ export async function ingestBenchmark(rawFile, supabaseClient) {
 }
 
 export async function ingestBrandFallback(rawFile, supabaseClient) {
-  // Real per-client p25/p50/p75/trimmed data -- confirmed no shape_class
-  // bucketing, just a flat client-keyed table, so no transform needed
-  // beyond passing the columns through as-is.
-  return ingestGeneric(rawFile, 'brand_fallback', `
-    select client, p25, p50, p75, trimmed from raw_upload
-  `, supabaseClient.pushBrandFallback, supabaseClient);
+  // Real per-client p25/p50/p75/trimmed data, no shape_class bucketing --
+  // confirmed. Header naming has ALREADY changed once between two real
+  // exports of the same underlying data ("Brand"/"P75 Order Duration"/...
+  // vs. "client"/"p75"/...) -- resolving columns dynamically by candidate
+  // name here instead of assuming one fixed header set, so a third naming
+  // variation doesn't silently break this again the same way.
+  await registerRawFile(rawFile, 'raw_upload');
+  const kind = await detectFileKind('raw_upload');
+  if (kind !== 'brand_fallback') {
+    throw new Error(`Expected a brand_fallback file, detected '${kind}' instead. Nothing loaded.`);
+  }
+  const cols = (await conn.query(`describe raw_upload`)).toArray().map(r => String(r.column_name));
+  const findCol = (candidates) => cols.find(c => candidates.includes(c.trim().toLowerCase()));
+  const clientCol = findCol(['brand', 'client']);
+  const p25Col = findCol(['p25', 'p25 order duration']);
+  const p50Col = findCol(['p50', 'p50 order duration']);
+  const p75Col = findCol(['p75', 'p75 order duration']);
+  const trimmedCol = findCol(['trimmed', 'trimmed mean']);
+  if (!clientCol || !p25Col || !p50Col || !p75Col || !trimmedCol) {
+    throw new Error(`Brand fallback file is missing an expected column (found: ${cols.join(', ')})`);
+  }
+  const rows = (await conn.query(`
+    select "${clientCol}" as client, "${p25Col}" as p25, "${p50Col}" as p50,
+      "${p75Col}" as p75, "${trimmedCol}" as trimmed
+    from raw_upload
+  `)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
+  await supabaseClient.pushBrandFallback(rows);
+  await conn.query(`drop table raw_upload`);
+  return { rowCount: rows.length };
 }
 
 export async function ingestAttendance(rawFile, supabaseClient) {
@@ -555,9 +580,17 @@ export async function ingestAttendance(rawFile, supabaseClient) {
 }
 
 export async function ingestEmployeeMapping(rawFile, supabaseClient) {
+  // NOTE: DuckDB's CSV auto-detection recognizes "yes"/blank in this
+  // column as boolean-like data and converts it to a real boolean (true /
+  // NULL) BEFORE this query ever runs -- confirmed by testing against the
+  // real uploaded file. The original version here tried to string-compare
+  // that already-boolean value against the literal text 'yes', which can
+  // never match (a real `true` casts to the text 'true', not 'yes'),
+  // silently marking every single employee as unflagged regardless of the
+  // source data. Fixed to use the already-inferred boolean directly.
   return ingestGeneric(rawFile, 'employee_mapping', `
     select employee_name, employee_id, agency, transaction_user_login, match_status,
-      coalesce(mixed_security_signal::text = 'yes', false) as mixed_security_signal,
+      coalesce(mixed_security_signal, false) as mixed_security_signal,
       name_variants
     from raw_upload
   `, supabaseClient.pushEmployeeMapping, supabaseClient);
