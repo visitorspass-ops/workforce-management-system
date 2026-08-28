@@ -529,6 +529,29 @@ async function loadRowsAsTable(rows, tableName) {
    pass nothing else, with every ingest function operating directly on the
    already-registered table. */
 
+// Sanitizes a row object pulled out of DuckDB-Wasm's Arrow results before
+// it crosses into JSON/RPC territory. CONFIRMED REAL BUG this guards
+// against: DuckDB-Wasm's Arrow-to-JS conversion has, at least once, turned
+// a clean plain number into a JS string that's literally wrapped in an
+// extra pair of quote characters (e.g. the 3-character string '"0"'
+// instead of the number 0 or the string '0') -- verified NOT a SQL logic
+// bug, since running the identical query against real (non-WASM) DuckDB
+// produces clean plain floats every time. Since this is a browser-specific
+// Arrow serialization quirk we can't reproduce or fully explain outside
+// the browser, this strips one level of literal wrapping quotes from any
+// string value that has them, as a safety net -- cheap, and a legitimate
+// business value would essentially never begin AND end with a literal
+// double-quote character by coincidence.
+function sanitizeRow(row) {
+  for (const key in row) {
+    const v = row[key];
+    if (typeof v === 'string' && v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"') {
+      row[key] = v.slice(1, -1);
+    }
+  }
+  return row;
+}
+
 export async function ingestNewUpload(supabaseClient, onStage) {
   const stage = onStage || (() => {});
   // No more ensureLocalBenchmarkTables() call -- curation produces facts
@@ -536,14 +559,14 @@ export async function ingestNewUpload(supabaseClient, onStage) {
   stage({ label: 'Curating rows (grouping into orders, computing durations)...' });
   await conn.query(`create or replace table curated_packing_local as ${curationQueryText('raw_upload')}`);
   const curatedRows = (await conn.query(`select * from curated_packing_local`)).toArray()
-    .map(r => (r.toJSON ? r.toJSON() : r));
+    .map(r => sanitizeRow(r.toJSON ? r.toJSON() : r));
 
   stage({ label: `Extracting presence records from ${curatedRows.length.toLocaleString()} curated rows...` });
   const presenceRows = (await conn.query(`
     select distinct "Transaction User" as transaction_user_login,
       strftime("Transaction Date"::date, '%Y-%m-%d') as activity_date
     from raw_upload
-  `)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
+  `)).toArray().map(r => sanitizeRow(r.toJSON ? r.toJSON() : r));
 
   // pushCuratedRows/pushWmsPresence now call the bulk_insert_* RPC
   // functions from migration_001.sql -- one round-trip per chunk instead
@@ -567,7 +590,7 @@ export async function ingestNewUpload(supabaseClient, onStage) {
 async function ingestGeneric(transformSql, pushFn, onStage) {
   const stage = onStage || (() => {});
   stage({ label: 'Reading and transforming rows...' });
-  const rows = (await conn.query(transformSql)).toArray().map(r => (r.toJSON ? r.toJSON() : r));
+  const rows = (await conn.query(transformSql)).toArray().map(r => sanitizeRow(r.toJSON ? r.toJSON() : r));
   await pushFn(rows, (p) => stage({
     label: `Pushing: ${p.rowsDone.toLocaleString()} / ${p.totalRows.toLocaleString()} (chunk ${p.chunksDone}/${p.totalChunks})`,
     fraction: p.chunksDone / p.totalChunks,
@@ -696,10 +719,20 @@ export async function ingestAttendance(supabaseClient, onStage) {
       group by employee_id, shift_date
     )
     select t.employee_id, strftime(t.shift_date, '%Y-%m-%d') as shift_date,
-      t.normal_hours, t.overtime_hours, t.delay_mins,
+      -- Explicit ::double casts, not trusting arg_min/sum's native output
+      -- type -- the SQL itself produces clean plain numbers (verified
+      -- against real DuckDB outside the browser), but DuckDB-Wasm's
+      -- Arrow-to-JS conversion corrupted one of these into a
+      -- literally-quote-wrapped string ('"0"') before it ever reached
+      -- Postgres. Forcing a plain double here, same principle as the
+      -- earlier TIMESTAMP-to-epoch-ms fix: never trust Arrow's raw JS
+      -- representation crossing the JSON boundary, always normalize first.
+      t.normal_hours::double as normal_hours,
+      t.overtime_hours::double as overtime_hours,
+      t.delay_mins::double as delay_mins,
       strftime(t.sign_in_ts, '%Y-%m-%d %H:%M:%S') as sign_in,
       strftime(t.sign_out_ts, '%Y-%m-%d %H:%M:%S') as sign_out,
-      g.switch_gap_mins
+      g.switch_gap_mins::double as switch_gap_mins
     from totals_by_day t
     join gaps_by_day g on g.employee_id = t.employee_id and g.shift_date = t.shift_date
   `, supabaseClient.pushAttendance, onStage);
@@ -723,9 +756,30 @@ export async function ingestEmployeeMapping(supabaseClient, onStage) {
 }
 
 export async function ingestSkuMapping(supabaseClient, onStage) {
+  // De-dupe (client, sku) BEFORE pushing -- confirmed real in your actual
+  // file: 17 pairs where the same SKU code has two different product names
+  // on file (weight-variant relabels, GWP naming, etc.). The locked policy
+  // (schema.sql: "duplicate names for the same key are last-write-wins, no
+  // conflict UI") already covers this case -- but ON CONFLICT DO UPDATE
+  // can only resolve a conflict against a row ALREADY in the table, not
+  // between two rows in the same INSERT statement. Two rows in one bulk
+  // upload sharing a key is exactly that second case, which Postgres
+  // rejects outright ("ON CONFLICT DO UPDATE command cannot affect row a
+  // second time") -- same root cause as the attendance bug, different
+  // table. Resolving "last one wins" here, before the rows ever leave
+  // DuckDB, is what actually implements the policy that was already
+  // decided; only one row per (client, sku) reaches Postgres.
   return ingestGeneric(`
-    select "Client" as client, "Product SKU" as sku, "Product Name" as product_name
-    from raw_upload
+    with numbered as (
+      select "Client" as client, "Product SKU" as sku, "Product Name" as product_name,
+        row_number() over () as file_order
+      from raw_upload
+    ),
+    deduped as (
+      select *, row_number() over (partition by client, sku order by file_order desc) as rn
+      from numbered
+    )
+    select client, sku, product_name from deduped where rn = 1
   `, supabaseClient.pushSkuMapping, onStage);
 }
 
