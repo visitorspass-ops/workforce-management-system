@@ -95,7 +95,7 @@
 
 <script type="module">
   import { initEngine, ingestNewUpload, ingestBenchmark, ingestBrandFallback, ingestAttendance,
-    ingestEmployeeMapping, ingestSkuMapping, registerRawFile, detectFileKind,
+    ingestEmployeeMapping, ingestSkuMapping, registerRawFile, detectFileKind, renameRawTable,
     loadAndClassify, computeHeadcount } from './js/duckdb-engine.js';
   import { initSupabase, pullLatestBenchmark, pullLatestBrandFallback } from './js/supabase-client.js';
 
@@ -168,30 +168,36 @@
   document.getElementById('runBtn').addEventListener('click', async () => {
     document.getElementById('runMsg').textContent = 'Processing...';
     try {
-      // Detect every file's kind FIRST, then process in a fixed priority
-      // order -- benchmark and brand_fallback before txn, since txn
-      // curation reads whatever's already pushed to Supabase for those.
-      // Processing in drop order instead could mean a benchmark file
-      // sitting in the SAME batch still isn't visible yet when the
-      // transaction log curates, silently falling back to bench_tier=
-      // 'none' even though the real benchmark was right there.
+      // Register + detect each file EXACTLY ONCE, under a unique table
+      // name so multiple files can be parsed and held simultaneously
+      // before processing order is decided. (An earlier version of this
+      // fix still parsed every file twice under the hood -- once to
+      // "peek," once for real -- which defeated the point; this is the
+      // corrected version.)
       const withKinds = [];
-      for (const d of detected) {
-        await registerRawFile(d.file, 'raw_upload');
-        const kind = await detectFileKind('raw_upload');
-        withKinds.push({ ...d, kind });
+      for (let i = 0; i < detected.length; i++) {
+        const d = detected[i];
+        const tableName = `raw_${i}`;
+        await registerRawFile(d.file, tableName);
+        const kind = await detectFileKind(tableName);
+        withKinds.push({ ...d, kind, tableName });
       }
       const priority = { benchmark: 0, brand_fallback: 0, employee_mapping: 1, sku_mapping: 1, attendance: 1, txn: 2 };
       withKinds.sort((a, b) => (priority[a.kind] ?? 1) - (priority[b.kind] ?? 1));
 
       for (const d of withKinds) {
+        // Cheap rename, not a re-parse -- hands the already-registered
+        // table to whichever ingest function matches, under the name
+        // every one of them expects ('raw_upload').
+        await renameRawTable(d.tableName, 'raw_upload');
+
         let result;
-        if (d.kind === 'txn') result = await ingestNewUpload(d.file, supabaseClient);
-        else if (d.kind === 'benchmark') result = await ingestBenchmark(d.file, supabaseClient);
-        else if (d.kind === 'brand_fallback') result = await ingestBrandFallback(d.file, supabaseClient);
-        else if (d.kind === 'attendance') result = await ingestAttendance(d.file, supabaseClient);
-        else if (d.kind === 'employee_mapping') result = await ingestEmployeeMapping(d.file, supabaseClient);
-        else if (d.kind === 'sku_mapping') result = await ingestSkuMapping(d.file, supabaseClient);
+        if (d.kind === 'txn') result = await ingestNewUpload(supabaseClient);
+        else if (d.kind === 'benchmark') result = await ingestBenchmark(supabaseClient);
+        else if (d.kind === 'brand_fallback') result = await ingestBrandFallback(supabaseClient);
+        else if (d.kind === 'attendance') result = await ingestAttendance(supabaseClient);
+        else if (d.kind === 'employee_mapping') result = await ingestEmployeeMapping(supabaseClient);
+        else if (d.kind === 'sku_mapping') result = await ingestSkuMapping(supabaseClient);
         else { showToast(`${d.name}: unrecognized file type, skipped.`); continue; }
 
         const count = result.curatedRowCount ?? result.rowCount;
