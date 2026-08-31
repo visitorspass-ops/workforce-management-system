@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+body {
+  background: #060a07;
+  color: #f0f5f0;
+  font-family: "Inter", sans-serif;
+}
+
+/* Reusable status-badge shapes. Color intent lives in Tailwind classes at
+   the call site (bg-goDim text-go, bg-amberDim text-amber, etc.) — this
+   file only defines shape, never a new hue. */
+.badge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
