@@ -21,7 +21,6 @@ RUN npm install --omit=dev
 
 COPY ingest-core ./ingest-core
 COPY worker/server.ts ./server.ts
-COPY worker/tsconfig.json ./tsconfig.json
 
 ENV NODE_ENV=production
 EXPOSE 8787
